@@ -1,0 +1,16 @@
+{
+  "name": "autodl-gpu-helper",
+  "version": "1.0.1",
+  "private": true,
+  "description": "AutoDL 单实例 GPU 抢卡 Tampermonkey 用户脚本",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test autodl-helper.test.cjs autodl-fast-wake.test.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}
