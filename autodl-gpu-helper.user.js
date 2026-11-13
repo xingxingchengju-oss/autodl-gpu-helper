@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AutoDL 单实例 GPU 抢卡助手
+// @name         AutoDL GPU 抢卡助手
 // @namespace    local.autodl.gpu-helper
-// @version      1.0.1
-// @description  正常 GPU 开机、完整实例 ID 定位、人工接管和同标签页续跑
+// @version      1.1.0
+// @description  选择 1～3 台实例，正常 GPU 开机、完整 ID 定位和人工接管
 // @match        https://www.autodl.com/*
 // @match        https://autodl.com/*
 // @run-at       document-idle
@@ -269,10 +269,13 @@
             this.generation = 0;
             this.run = null;
             this.unresolvedDialog = false;
-            this.model = { active: false, state: '待开始', detail: '选择实例后开始', attempts: 0, nextAt: 0, log: [] };
+            this.model = { active: false, state: '待开始', detail: '选择实例后开始', attempts: 0, nextAt: 0, targets: [], log: [] };
         }
 
         show(state, detail) {
+            if (this.run) this.model.targets = this.run.targets.map(target => ({
+                id: target.id, state: target.state, attempts: target.attempts, done: target.done
+            }));
             this.model.state = state;
             this.model.detail = detail;
             this.update({ ...this.model });
@@ -312,16 +315,23 @@
 
         save(run) {
             this.guard(run);
-            this.session.setItem(SESSION_KEY, JSON.stringify({ version: 1, active: true, id: run.id,
-                seconds: run.seconds, phase: run.phase, submittedAt: run.submittedAt,
-                attempts: this.model.attempts, sawStarting: run.sawStarting }));
+            this.session.setItem(SESSION_KEY, JSON.stringify({ version: 2, active: true,
+                id: run.current.id, phase: run.current.phase, submittedAt: run.current.submittedAt,
+                sawStarting: run.current.sawStarting, ids: run.targets.map(target => target.id),
+                targets: run.targets, seconds: run.seconds, attempts: this.model.attempts,
+                feedbackId: run.feedbackTarget?.id || null }));
         }
 
         readSaved() {
             try {
                 const saved = JSON.parse(this.session.getItem(SESSION_KEY) || 'null');
-                return saved?.version === 1 && saved.active === true ? saved : null;
+                return [1, 2].includes(saved?.version) && saved.active === true ? saved : null;
             } catch { return null; }
+        }
+
+        readTargets(run) {
+            this.guard(run);
+            return run.targets.filter(target => !target.done).map(target => this.page.readTarget(target.id));
         }
 
         clearSaved() {
@@ -341,15 +351,21 @@
         stop(reason = '已停止，人工接管') {
             const run = this.run;
             if (!run) return;
-            this.unresolvedDialog = this.unresolvedDialog || run.phase === 'opening';
+            this.unresolvedDialog = this.unresolvedDialog || run.current.phase === 'opening';
             this.deactivate(run);
-            // This is the only post-stop sample. No timer, click or request is issued.
-            let result;
-            try {
-                const snapshot = this.page.readTarget(run.id);
-                const uncertain = run.submittedAt && snapshot.status === '已关机' ? '，最近提交结果待确认' : '';
-                result = `${snapshot.status}${uncertain}`;
-            } catch (error) { result = `结果待确认（${error.message}）`; }
+            // Sample each selected instance exactly once after revoking all automation.
+            const results = run.targets.map(target => {
+                let result;
+                try {
+                    const snapshot = this.page.readTarget(target.id);
+                    const uncertain = target.submittedAt && snapshot.status === '已关机' ? '，最近提交结果待确认' : '';
+                    result = `${snapshot.status}${uncertain}`;
+                } catch (error) { result = `结果待确认（${error.message}）`; }
+                target.state = result;
+                return `${target.id} · ${result}`;
+            });
+            this.model.targets = run.targets.map(target => ({ ...target }));
+            const result = results.join(' | ');
             const time = new Date(this.now()).toLocaleTimeString('zh-CN', { hour12: false });
             const pending = this.unresolvedDialog ? '。再次自动化前请刷新页面，以结束旧开机检查的弹窗回调' : '';
             this.show('已停止', `${reason}。页面快照 ${time} · ${result}${pending}`);
@@ -358,7 +374,7 @@
 
         pause(run, message) {
             if (this.run !== run) return;
-            this.unresolvedDialog = this.unresolvedDialog || run.phase === 'opening';
+            this.unresolvedDialog = this.unresolvedDialog || run.current.phase === 'opening';
             this.deactivate(run);
             this.show('已暂停', message);
             this.log(message);
@@ -370,9 +386,12 @@
             if (!feedback) return;
             if (feedback.kind === 'fatal') throw new PageError(feedback.text);
             if (feedback.kind === 'capacity') {
-                run.submittedAt = 0;
-                run.sawStarting = false;
-                run.phase = 'waiting';
+                const target = run.feedbackTarget;
+                if (!target) throw new PageError(`无法关联实例的缺卡反馈，请人工核对（${feedback.text}）`);
+                target.submittedAt = 0;
+                target.sawStarting = false;
+                target.phase = 'waiting';
+                target.state = '等待资源';
                 this.save(run);
             }
             throw new RetryError(feedback.text, feedback.kind);
@@ -397,7 +416,7 @@
                 const ready = await this.waitFor(() => !this.page.isLoading(), this.timing.refresh, run);
                 if (!ready) throw new RetryError('列表加载超时，等待后重新检查');
             }
-            this.page.readTarget(run.id);
+            this.readTargets(run);
             let sawLoading = false;
             const observer = new this.window.MutationObserver(records => {
                 // Observe the loading transition even when a very fast request finishes between polls.
@@ -423,7 +442,7 @@
                 if (!refreshed) throw new RetryError('未观察到列表刷新完成，等待后重试');
             } finally { observer.disconnect(); }
             this.guard(run);
-            return this.page.readTarget(run.id);
+            return this.readTargets(run);
         }
 
         readyToBoot(snapshot) {
@@ -444,15 +463,23 @@
                     this.guard(run);
                     if (this.page.isLoading()) return;
                     if (this.page.dialogs().length) throw new PageError('出现新的弹窗，请人工接管');
-                    const snapshot = this.page.readTarget(run.id);
-                    const ready = this.readyToBoot(snapshot);
-                    if (ready && !run.lastReady) readySnapshot = snapshot;
-                    run.lastReady = ready;
+                    const snapshots = this.readTargets(run);
+                    const pending = run.targets.some(target => !target.done && (target.submittedAt || target.sawStarting));
+                    for (const snapshot of snapshots) {
+                        const target = run.targets.find(item => item.id === snapshot.id);
+                        const ready = this.readyToBoot(snapshot);
+                        if (!pending && ready && !target.lastReady) {
+                            target.nextAttemptAt = 0;
+                            readySnapshot = snapshots;
+                        }
+                        if (snapshot.status === '运行中') readySnapshot = snapshots;
+                        target.lastReady = ready;
+                    }
                 } catch (error) { observationError = error; }
                 if (readySnapshot || observationError) wake.abort();
             };
             try {
-                if (allowReadyWake && !run.submittedAt && !run.sawStarting && run.phase === 'waiting') {
+                if (allowReadyWake) {
                     const table = this.page.table();
                     observer = new this.window.MutationObserver(inspect);
                     observer.observe(table.closest('.data-list-common') || table, {
@@ -480,18 +507,21 @@
         async attempt(run, initial) {
             this.guard(run);
             if (this.page.dialogs().length) throw new PageError('开机前存在弹窗，请人工处理');
-            const current = this.page.readTarget(run.id);
+            const current = this.page.readTarget(run.current.id);
             if (current.fingerprint !== initial.fingerprint || current.status !== '已关机') return;
             const button = this.page.bootButton(current);
             if (!enabled(button)) {
                 this.show('等待资源', '正常 GPU 开机按钮暂时不可用');
                 return;
             }
-            run.phase = 'opening';
+            run.current.phase = 'opening';
+            run.current.state = '准备开机';
+            run.current.attempts += 1;
+            run.feedbackTarget = run.current;
             this.model.attempts += 1;
             this.save(run);
-            this.show('准备开机', '正在等待本站开机检查与确认框');
-            this.log(`第 ${this.model.attempts} 次正常 GPU 开机检查 · ${run.id}`);
+            this.show('准备开机', `${run.current.id} · 正在等待本站开机检查与确认框`);
+            this.log(`第 ${this.model.attempts} 次正常 GPU 开机检查 · ${run.current.id}`);
             this.guard(run);
             button.click();
             const dialog = await this.waitFor(() => {
@@ -504,7 +534,7 @@
             // Yield once so a queued human stop takes effect before confirmation.
             await this.delay(0, run);
             this.guard(run);
-            const latest = this.page.readTarget(run.id);
+            const latest = this.page.readTarget(run.current.id);
             if (latest.fingerprint !== current.fingerprint || latest.status !== '已关机') {
                 throw new PageError('确认前实例信息或状态发生变化，请人工核验');
             }
@@ -520,18 +550,19 @@
                 action.button.click();
                 const closed = await this.waitFor(() => !visible(dialog), this.timing.dialog, run);
                 if (!closed) throw new PageError('缺卡提示未关闭，请人工处理');
-                run.phase = 'waiting';
+                run.current.phase = 'waiting';
                 this.save(run);
                 throw new RetryError('本次检查仍缺卡，已关闭缺卡提示并继续等待', 'capacity');
             }
             // Write intent before the click so a reload cannot silently lose an in-flight submission.
-            run.submittedAt = this.now();
-            run.phase = 'submitted';
+            run.current.submittedAt = this.now();
+            run.current.phase = 'submitted';
+            run.current.state = '等待启动';
             this.save(run);
             this.guard(run);
             action.button.click();
             this.guard(run);
-            this.log(`第 ${this.model.attempts} 次正常 GPU 开机确认已提交`);
+            this.log(`第 ${this.model.attempts} 次正常 GPU 开机确认已提交 · ${run.current.id}`);
             this.show('等待启动', '开机结果待确认，正在核对实际状态');
             const closed = await this.waitFor(() => !visible(dialog), this.timing.dialog, run);
             if (!closed) throw new PageError('已提交确认，弹窗仍未关闭。请人工核对结果');
@@ -543,53 +574,91 @@
             let allowReadyWake = false;
             while (true) {
                 try {
-                    let snapshot = interval ? await this.waitInterval(run, interval, allowReadyWake) : null;
+                    let snapshots = interval ? await this.waitInterval(run, interval, allowReadyWake) : null;
                     this.guard(run);
                     this.feedback(run);
-                    if (!interval && !run.submittedAt && !this.page.isLoading() && !this.page.dialogs().length) {
-                        const current = this.page.readTarget(run.id);
-                        if (this.readyToBoot(current)) snapshot = current;
+                    if (!interval && !this.page.isLoading() && !this.page.dialogs().length) {
+                        const current = this.readTargets(run);
+                        if (current.some(snapshot => this.readyToBoot(snapshot) || snapshot.status === '运行中')) snapshots = current;
                     }
-                    if (snapshot) this.log('检测到目标 GPU 充足，立即进入正常开机检查');
-                    this.show('检查状态', `正在核对 ${run.id}`);
-                    snapshot = snapshot || await this.refresh(run);
+                    if (snapshots) this.log('检测到目标状态变化，立即核对实例');
+                    this.show('检查状态', `正在核对 ${run.targets.length} 台实例`);
+                    snapshots = snapshots || await this.refresh(run);
                     this.guard(run);
-                    run.lastReady = this.readyToBoot(snapshot);
-                    if (snapshot.status === '运行中') {
+                    for (const snapshot of snapshots) {
+                        const target = run.targets.find(item => item.id === snapshot.id);
+                        target.lastReady = this.readyToBoot(snapshot);
+                        if (snapshot.status === '运行中') {
+                            target.done = true;
+                            target.phase = 'done';
+                            target.state = '运行中（已完成）';
+                            if (run.feedbackTarget === target) run.feedbackTarget = null;
+                            this.save(run);
+                            this.log(`已验证正常 GPU 运行状态 · ${target.id}`);
+                            this.guard(run);
+                            this.notify(target.id);
+                        } else if (snapshot.status === '开机中') {
+                            target.sawStarting = true;
+                            target.phase = 'starting';
+                            target.state = '开机中';
+                        } else if (target.sawStarting) {
+                            throw new PageError(`${target.id} 开机后返回关机状态，请核对失败原因`);
+                        } else if (target.submittedAt) {
+                            if (this.now() - target.submittedAt >= this.timing.uncertain) {
+                                throw new PageError(`${target.id} 已提交的开机结果仍待确认，请人工核对实例状态`);
+                            }
+                            target.state = '等待启动';
+                        } else {
+                            target.phase = 'waiting';
+                            target.state = snapshot.availability === false ? '等待资源' : '等待开机';
+                        }
+                    }
+                    this.save(run);
+                    this.show('等待资源', '等待目标主机释放 GPU');
+                    if (run.targets.every(target => target.done)) {
                         this.deactivate(run);
-                        this.show('抢卡成功', `${run.id} 已进入运行中`);
-                        this.log('已验证正常 GPU 运行状态');
-                        this.notify(run.id);
+                        this.show('抢卡成功', `所选 ${run.targets.length} 台实例均已进入运行中`);
                         return;
                     }
-                    if (snapshot.status === '开机中') {
-                        run.sawStarting = true;
-                        run.phase = 'starting';
-                        this.save(run);
-                        this.show('等待启动', '目标实例开机中，继续观察运行状态');
-                    } else if (run.submittedAt) {
-                        if (run.sawStarting) {
-                            throw new PageError('实例开机后返回关机状态，请核对开机失败原因');
-                        }
-                        if (this.now() - run.submittedAt >= this.timing.uncertain) {
-                            throw new PageError('已提交的开机结果仍待确认，请人工核对实例状态');
-                        }
-                        this.show('等待启动', '已提交开机，等待服务器状态更新');
-                    } else if (snapshot.availability === false) {
-                        run.phase = 'waiting';
-                        this.save(run);
-                        this.show('等待资源', '目标主机当前 GPU 不足');
+                    // One unresolved boot request owns the shared page feedback and dialog.
+                    // Other instances remain queued until its result has been reconciled.
+                    const pending = run.targets.find(target => !target.done && (target.submittedAt || target.sawStarting));
+                    if (pending) {
+                        run.current = pending;
+                        this.show('等待启动', `${pending.id} · 正在核对启动结果`);
                     } else {
-                        await this.attempt(run, snapshot);
+                        for (const snapshot of snapshots) {
+                            const target = run.targets.find(item => item.id === snapshot.id);
+                            if (target.done || snapshot.availability === false || this.now() < target.nextAttemptAt) continue;
+                            this.guard(run);
+                            this.feedback(run);
+                            run.current = target;
+                            target.nextAttemptAt = this.now() + run.seconds * 1000;
+                            try {
+                                await this.attempt(run, snapshot);
+                            } catch (error) {
+                                if (!(error instanceof RetryError) || error.kind !== 'capacity') throw error;
+                                target.phase = 'waiting';
+                                target.state = '等待资源';
+                                this.save(run);
+                                this.log(`${target.id} · ${error.message}`);
+                            }
+                            if (target.submittedAt) break;
+                        }
+                        this.show(run.current.submittedAt ? '等待启动' : '等待资源',
+                            run.current.submittedAt ? `${run.current.id} · 正在核对启动结果` : '等待目标主机释放 GPU');
                     }
-                    if (!run.submittedAt && !run.sawStarting && run.phase !== 'opening') run.phase = 'waiting';
-                    allowReadyWake = !run.submittedAt && !run.sawStarting && run.phase === 'waiting';
+                    this.save(run);
+                    allowReadyWake = true;
                     failures = 0;
                     interval = run.seconds * 1000;
                 } catch (error) {
                     if (error === CANCELLED) return;
                     if (this.run !== run) return;
                     if (!(error instanceof RetryError)) throw error;
+                    if (error.kind !== 'capacity' && run.current.phase === 'opening') {
+                        throw new PageError('开机检查异常，弹窗归属尚待确认。请刷新页面后重新开始');
+                    }
                     if (error.kind === 'capacity') {
                         failures = 0;
                         allowReadyWake = true;
@@ -612,19 +681,28 @@
                 this.show('已暂停', '前次开机检查的弹窗归属尚未解除，请刷新页面后重新开始');
                 return;
             }
-            const id = normalizeId(config.id);
+            const ids = (Array.isArray(config.ids) ? config.ids : [config.id]).map(normalizeId);
             const seconds = Number(config.seconds);
-            if (!INSTANCE_ID.test(id) || !Number.isFinite(seconds) || seconds < 5 || seconds * 1000 > 2147483647) {
-                this.show('待开始', '请填写完整实例 ID，并将检查间隔设置为至少 5 秒');
+            if (ids.length < 1 || ids.length > 3 || new Set(ids).size !== ids.length ||
+                ids.some(id => !INSTANCE_ID.test(id)) || !Number.isFinite(seconds) || seconds < 5 || seconds * 1000 > 2147483647) {
+                this.show('待开始', '请选择 1～3 个不同的完整实例 ID，并将检查间隔设置为至少 5 秒');
                 return;
             }
             if (!this.locks?.request) {
                 this.show('已暂停', '此环境缺少 Web Locks，请使用最新版 Chrome 的 HTTPS 页面');
                 return;
             }
-            const run = { id, seconds, generation: ++this.generation, abort: new this.window.AbortController(),
-                phase: saved?.phase || 'checking', submittedAt: Number(saved?.submittedAt) || 0,
-                sawStarting: Boolean(saved?.sawStarting), lastReady: false };
+            const previous = saved?.targets || (saved ? [{ ...saved, id: saved.id || ids[0] }] : []);
+            const targets = ids.map(id => {
+                const old = previous.find(target => target.id === id);
+                return { id, phase: old?.phase || 'checking', submittedAt: Number(old?.submittedAt) || 0,
+                    sawStarting: Boolean(old?.sawStarting), lastReady: false, done: Boolean(old?.done),
+                    attempts: Number(old?.attempts) || 0, nextAttemptAt: Number(old?.nextAttemptAt) || 0,
+                    state: old?.done ? '运行中（已完成）' : '等待检查' };
+            });
+            const run = { targets, current: targets[0], seconds,
+                generation: ++this.generation, abort: new this.window.AbortController(),
+                feedbackTarget: targets.find(target => target.id === saved?.feedbackId || target.submittedAt || target.sawStarting) || null };
             this.run = run;
             this.model.active = true;
             this.model.attempts = Number(saved?.attempts) || 0;
@@ -640,9 +718,14 @@
                         return table && !this.page.isLoading() && this.page.rows(table).length;
                     }, this.timing.refresh, run);
                     if (!ready) throw new PageError('实例列表加载超时，请核对登录、筛选与分页后重新开始');
-                    this.page.readTarget(id);
+                    for (const target of run.targets) {
+                        const snapshot = this.page.readTarget(target.id);
+                        if (target.done && snapshot.status !== '运行中') {
+                            throw new PageError(`${target.id} 的已完成状态发生变化，请人工核对后重新开始`);
+                        }
+                    }
                     this.save(run);
-                    this.log(`${saved ? '恢复' : '开始'}任务 · ${id} · ${seconds} 秒间隔`);
+                    this.log(`${saved ? '恢复' : '开始'}任务 · ${ids.join('、')} · ${seconds} 秒间隔`);
                     await this.loop(run);
                 });
             } catch (error) {
@@ -659,7 +742,7 @@
             this.run = null;
             this.model.active = false;
             this.model.nextAt = 0;
-            this.unresolvedDialog = this.unresolvedDialog || run.phase === 'opening';
+            this.unresolvedDialog = this.unresolvedDialog || run.current.phase === 'opening';
             run.abort.abort();
             this.show('已暂停', '页面已离开，同标签页刷新后会重新核对任务');
         }
@@ -676,7 +759,7 @@
             <style>
                 :host { all: initial; position: fixed; right: 20px; bottom: 24px; z-index: 2147483647; }
                 * { box-sizing: border-box; }
-                section { width: 340px; max-width: calc(100vw - 24px); padding: 18px; background: #fff;
+                section { width: 360px; max-width: calc(100vw - 24px); max-height: calc(100vh - 48px); overflow-y: auto; padding: 18px; background: #fff;
                     border: 1px solid #dce3f0; border-radius: 14px; box-shadow: 0 12px 40px #172b4d26;
                     font: 13px/1.6 system-ui, 'PingFang SC', sans-serif; color: #26344d; }
                 header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
@@ -693,26 +776,47 @@
                 .row label { margin: 0; flex: 1; } .row input { width: 88px; }
                 #status { margin: 14px 0 0; padding: 10px; background: #f1f5ff; border-radius: 8px; overflow-wrap: anywhere; }
                 #state { font-weight: 650; } #detail { color: #516079; margin-top: 3px; }
+                #targets-state { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; margin-top: 8px; }
+                .actions { position: sticky; bottom: 0; background: #fff; padding: 6px 0; }
                 #stats, .hint { color: #6c7890; font-size: 12px; margin-top: 8px; }
                 details { margin-top: 10px; } summary { cursor: pointer; }
                 #log { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
                 section.collapsed .body { display: none; } section.collapsed { width: 270px; }
             </style>
             <section aria-label="AutoDL GPU 抢卡助手">
-                <header><h2>AutoDL GPU 抢卡助手 v1.0.1</h2><button id="collapse" aria-label="收起面板">收起</button></header>
+                <header><h2>AutoDL GPU 抢卡助手 v1.1.0</h2><button id="collapse" aria-label="收起面板">收起</button></header>
                 <div class="body">
-                    <label for="instances">当前页实例</label><select id="instances"><option value="">选择实例</option></select>
+                    <label for="count">要抢几台实例</label><select id="count"><option value="1">1 台</option><option value="2">2 台</option><option value="3">3 台</option></select>
+                    <label for="instances">实例 1</label><select id="instances"><option value="">选择实例</option></select>
                     <label for="target">完整实例 ID</label><input id="target" autocomplete="off" spellcheck="false" placeholder="粘贴完整实例 ID">
+                    <div id="slot2" hidden><label for="instances2">实例 2</label><select id="instances2"><option value="">选择实例</option></select>
+                    <label for="target2">完整实例 ID</label><input id="target2" autocomplete="off" spellcheck="false" placeholder="粘贴完整实例 ID"></div>
+                    <div id="slot3" hidden><label for="instances3">实例 3</label><select id="instances3"><option value="">选择实例</option></select>
+                    <label for="target3">完整实例 ID</label><input id="target3" autocomplete="off" spellcheck="false" placeholder="粘贴完整实例 ID"></div>
                     <div class="row"><label for="interval">检查间隔（秒）</label><input id="interval" type="number" min="5" step="1" value="10"><button id="read">读取列表</button></div>
-                    <div class="hint">开始后自动确认正常 GPU 开机，开机后按 AutoDL 规则计费。</div>
+                    <div class="hint">开始后依次开机所选实例，每台成功后继续剩余实例，开机后按 AutoDL 规则计费。</div>
                 </div>
                 <div class="actions"><button id="start">开始抢卡</button><button id="stop" disabled>停止 / 接管</button></div>
                 <div id="status" role="status" aria-live="polite"><div id="state">待开始</div><div id="detail">正在读取页面</div></div>
-                <div id="stats"></div>
+                <div id="stats"></div><div id="targets-state" aria-live="polite"></div>
                 <div class="body"><details><summary>最近记录</summary><div id="log"></div></details></div>
             </section>`;
         const get = id => shadow.getElementById(id);
         const page = new AutoDLPage(window);
+        const slots = ['', '2', '3'];
+        function showSlots() {
+            for (const index of [2, 3]) get(`slot${index}`).hidden = index > Number(get('count').value);
+        }
+        function setSelection(config) {
+            const ids = config.ids || [config.id || ''];
+            get('count').value = String(Math.min(3, Math.max(1, ids.length)));
+            slots.forEach((suffix, index) => {
+                const id = normalizeId(ids[index]);
+                get(`target${suffix}`).value = id;
+                get(`instances${suffix}`).value = id;
+            });
+            showSlots();
+        }
         let initializationTimer = null;
         const render = model => {
             if (['已停止', '已暂停', '抢卡成功'].includes(model.state)) {
@@ -721,9 +825,11 @@
             }
             get('state').textContent = model.state;
             get('detail').textContent = model.detail;
-            get('stats').textContent = `尝试 ${model.attempts} 次${model.nextAt ? ` · ${Math.max(0, Math.ceil((model.nextAt - Date.now()) / 1000))} 秒后检查` : ''}`;
+            get('targets-state').textContent = (model.targets || []).map(target =>
+                `${target.id} · ${target.state} · 尝试 ${target.attempts} 次`).join('\n');
+            get('stats').textContent = `完成 ${(model.targets || []).filter(target => target.done).length}/${(model.targets || []).length || Number(get('count').value)} 台 · 尝试 ${model.attempts} 次${model.nextAt ? ` · ${Math.max(0, Math.ceil((model.nextAt - Date.now()) / 1000))} 秒后检查` : ''}`;
             get('log').textContent = model.log.join('\n');
-            for (const id of ['instances', 'target', 'interval', 'read', 'start']) get(id).disabled = model.active;
+            for (const id of ['count', 'instances', 'target', 'instances2', 'target2', 'instances3', 'target3', 'interval', 'read', 'start']) get(id).disabled = model.active;
             get('stop').disabled = !model.active;
         };
         const grabber = new Grabber(page, { update: render, notify: id => {
@@ -734,24 +840,38 @@
         try {
             const settings = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) || 'null');
             if (settings) {
-                get('target').value = normalizeId(settings.id);
+                setSelection(settings);
                 get('interval').value = Number(settings.seconds) >= 5 ? settings.seconds : 10;
             }
         } catch { /* Use defaults if old settings are invalid. */ }
         function readList() {
             const list = page.list();
-            get('instances').replaceChildren(new window.Option('选择实例', ''));
-            for (const instance of list) get('instances').appendChild(new window.Option(instance.label, instance.id));
-            get('instances').value = get('target').value;
+            for (const suffix of slots) {
+                const select = get(`instances${suffix}`);
+                select.replaceChildren(new window.Option('选择实例', ''));
+                for (const instance of list) select.appendChild(new window.Option(instance.label, instance.id));
+                select.value = get(`target${suffix}`).value;
+            }
         }
         get('read').addEventListener('click', () => {
             try { readList(); grabber.show('待开始', '当前页实例已读取'); }
             catch (error) { grabber.show('待开始', error.message); }
         });
-        get('instances').addEventListener('change', () => { get('target').value = get('instances').value; });
+        get('count').addEventListener('change', () => {
+            showSlots();
+            grabber.model.targets = [];
+            grabber.model.attempts = 0;
+            grabber.show('待开始', `请选择 ${get('count').value} 台实例并核对完整 ID`);
+        });
+        for (const suffix of slots) {
+            get(`instances${suffix}`).addEventListener('change', () => {
+                get(`target${suffix}`).value = get(`instances${suffix}`).value;
+            });
+        }
         get('start').addEventListener('click', () => {
-            const config = { id: normalizeId(get('target').value), seconds: Number(get('interval').value) };
-            get('target').value = config.id;
+            const ids = slots.slice(0, Number(get('count').value)).map(suffix => normalizeId(get(`target${suffix}`).value));
+            const config = { ids, seconds: Number(get('interval').value) };
+            setSelection(config);
             try { window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(config)); } catch { /* Task state is stored separately. */ }
             if (window.Notification?.permission === 'default') window.Notification.requestPermission().catch(() => {});
             void grabber.start(config);
@@ -790,7 +910,7 @@
         }
         ready();
         if (saved) {
-            get('target').value = saved.id;
+            setSelection(saved);
             get('interval').value = saved.seconds;
             void grabber.start(saved, saved);
         }
